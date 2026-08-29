@@ -2,337 +2,191 @@ require("dotenv").config();
 
 const express = require("express");
 const crypto = require("crypto");
-const db = require("./database");
+const { pool, initializeDatabase } = require("./database");
 
 const app = express();
-
-app.use(express.json());
-
 const PORT = process.env.PORT || 3000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
-// ------------------------------------------
-// Helpers
-// ------------------------------------------
+app.use(express.json());
 
 function generateLicense() {
     function part() {
-        return crypto
-            .randomBytes(3)
-            .toString("hex")
-            .toUpperCase();
+        return crypto.randomBytes(3).toString("hex").toUpperCase();
     }
 
     return `REMMM-${part()}-${part()}-${part()}`;
 }
 
-function generateMachineId(input) {
-    return crypto
-        .createHash("sha256")
-        .update(input)
-        .digest("hex");
-}
-
-// ------------------------------------------
-// Health check
-// ------------------------------------------
-
-app.get("/", (req, res) => {
-    res.json({
-        service: "REMMM License API",
-        status: "online"
-    });
-});
-
-// ------------------------------------------
-// Admin authentication middleware
-// ------------------------------------------
-
 function adminOnly(req, res, next) {
-
-    const secret = req.headers["x-admin-secret"];
-
-    if (!secret || secret !== ADMIN_SECRET) {
-        return res.status(401).json({
-            success: false,
-            message: "Unauthorized"
-        });
+    if (!req.headers["x-admin-secret"] || req.headers["x-admin-secret"] !== ADMIN_SECRET) {
+        return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
     next();
 }
 
-// ------------------------------------------
-// CREATE LICENSE
-// ------------------------------------------
+function databaseError(res, error) {
+    console.error(error);
+    return res.status(500).json({
+        success: false,
+        message: "License database error"
+    });
+}
 
-app.post("/api/admin/licenses", adminOnly, (req, res) => {
+app.get("/", (req, res) => {
+    res.json({ service: "REMMM License API", status: "online" });
+});
 
+app.post("/api/admin/licenses", adminOnly, async (req, res) => {
     const {
         discord_id = null,
         max_activations = 1,
         expires_at = null
     } = req.body;
 
-    let license;
+    try {
+        const result = await pool.query(`
+            INSERT INTO licenses (license_key, discord_id, max_activations, expires_at)
+            VALUES ($1, $2, $3, $4)
+            RETURNING license_key
+        `, [generateLicense(), discord_id, max_activations, expires_at]);
 
-    while (true) {
-
-        license = generateLicense();
-
-        try {
-
-            db.prepare(`
-                INSERT INTO licenses (
-                    license_key,
-                    discord_id,
-                    max_activations,
-                    expires_at
-                )
-                VALUES (?, ?, ?, ?)
-            `).run(
-                license,
-                discord_id,
-                max_activations,
-                expires_at
-            );
-
-            break;
-
-        } catch (error) {
-
-            if (!error.message.includes("UNIQUE")) {
-                throw error;
-            }
-        }
+        return res.json({ success: true, license: result.rows[0].license_key });
+    } catch (error) {
+        return databaseError(res, error);
     }
-
-    res.json({
-        success: true,
-        license
-    });
 });
 
-// ------------------------------------------
-// LICENSE INFO
-// ------------------------------------------
+app.get("/api/admin/licenses/:license", adminOnly, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT * FROM licenses WHERE license_key = $1",
+            [req.params.license]
+        );
 
-app.get("/api/admin/licenses/:license", adminOnly, (req, res) => {
+        if (result.rowCount === 0) {
+            return res.status(404).json({ success: false, message: "License not found" });
+        }
 
-    const license = db.prepare(`
-        SELECT *
-        FROM licenses
-        WHERE license_key = ?
-    `).get(req.params.license);
-
-    if (!license) {
-        return res.status(404).json({
-            success: false,
-            message: "License not found"
-        });
+        return res.json({ success: true, license: result.rows[0] });
+    } catch (error) {
+        return databaseError(res, error);
     }
-
-    res.json({
-        success: true,
-        license
-    });
 });
 
-// ------------------------------------------
-// REVOKE LICENSE
-// ------------------------------------------
+async function setLicenseStatus(req, res, status) {
+    try {
+        const result = await pool.query(
+            "UPDATE licenses SET status = $1 WHERE license_key = $2",
+            [status, req.params.license]
+        );
 
-app.post(
-    "/api/admin/licenses/:license/revoke",
-    adminOnly,
-    (req, res) => {
-
-        const result = db.prepare(`
-            UPDATE licenses
-            SET status = 'revoked'
-            WHERE license_key = ?
-        `).run(req.params.license);
-
-        if (result.changes === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "License not found"
-            });
+        if (result.rowCount === 0) {
+            return res.status(404).json({ success: false, message: "License not found" });
         }
 
-        res.json({
+        return res.json({
             success: true,
-            message: "License revoked"
+            message: status === "active" ? "License reactivated" : "License revoked"
         });
+    } catch (error) {
+        return databaseError(res, error);
     }
-);
+}
 
-// ------------------------------------------
-// REACTIVATE LICENSE
-// ------------------------------------------
+app.post("/api/admin/licenses/:license/revoke", adminOnly, (req, res) => {
+    setLicenseStatus(req, res, "revoked");
+});
 
-app.post(
-    "/api/admin/licenses/:license/reactivate",
-    adminOnly,
-    (req, res) => {
+app.post("/api/admin/licenses/:license/reactivate", adminOnly, (req, res) => {
+    setLicenseStatus(req, res, "active");
+});
 
-        const result = db.prepare(`
+app.post("/api/admin/licenses/:license/reset", adminOnly, async (req, res) => {
+    try {
+        const result = await pool.query(`
             UPDATE licenses
-            SET status = 'active'
-            WHERE license_key = ?
-        `).run(req.params.license);
+            SET machine_id = NULL, activation_count = 0
+            WHERE license_key = $1
+        `, [req.params.license]);
 
-        if (result.changes === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "License not found"
-            });
+        if (result.rowCount === 0) {
+            return res.status(404).json({ success: false, message: "License not found" });
         }
 
-        res.json({
-            success: true,
-            message: "License reactivated"
-        });
+        return res.json({ success: true, message: "Device activation reset" });
+    } catch (error) {
+        return databaseError(res, error);
     }
-);
+});
 
-// ------------------------------------------
-// RESET DEVICE
-// ------------------------------------------
-
-app.post(
-    "/api/admin/licenses/:license/reset",
-    adminOnly,
-    (req, res) => {
-
-        const result = db.prepare(`
-            UPDATE licenses
-            SET machine_id = NULL,
-                activation_count = 0
-            WHERE license_key = ?
-        `).run(req.params.license);
-
-        if (result.changes === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "License not found"
-            });
-        }
-
-        res.json({
-            success: true,
-            message: "Device activation reset"
-        });
-    }
-);
-
-// ------------------------------------------
-// ACTIVATE LICENSE
-// ------------------------------------------
-
-app.post("/api/license/activate", (req, res) => {
-
-    const {
-        license,
-        machine_id
-    } = req.body;
+app.post("/api/license/activate", async (req, res) => {
+    const { license, machine_id } = req.body;
 
     if (!license || !machine_id) {
-
-        return res.status(400).json({
-            valid: false,
-            message: "Missing license or machine ID"
-        });
+        return res.status(400).json({ valid: false, message: "Missing license or machine ID" });
     }
 
-    const row = db.prepare(`
-        SELECT *
-        FROM licenses
-        WHERE license_key = ?
-    `).get(license);
+    try {
+        const result = await pool.query(
+            "SELECT * FROM licenses WHERE license_key = $1",
+            [license]
+        );
+        const row = result.rows[0];
 
-    if (!row) {
+        if (!row) {
+            return res.json({ valid: false, message: "Invalid license" });
+        }
 
-        return res.json({
-            valid: false,
-            message: "Invalid license"
-        });
-    }
+        if (row.status !== "active") {
+            return res.json({ valid: false, message: "License is not active" });
+        }
 
-    if (row.status !== "active") {
+        if (row.expires_at && Date.now() > new Date(row.expires_at).getTime()) {
+            return res.json({ valid: false, message: "License expired" });
+        }
 
-        return res.json({
-            valid: false,
-            message: "License is not active"
-        });
-    }
-
-    // Check expiration
-    if (row.expires_at) {
-
-        const expiry = new Date(row.expires_at);
-
-        if (Date.now() > expiry.getTime()) {
-
+        if (row.machine_id && row.machine_id !== machine_id) {
             return res.json({
                 valid: false,
-                message: "License expired"
+                message: "License already activated on another device"
             });
         }
-    }
 
-    // Already activated
-    if (row.machine_id) {
+        if (!row.machine_id) {
+            const activation = await pool.query(`
+                UPDATE licenses
+                SET machine_id = $1, activation_count = activation_count + 1
+                WHERE license_key = $2 AND machine_id IS NULL
+            `, [machine_id, license]);
 
-        if (row.machine_id === machine_id) {
-
-            return res.json({
-                valid: true,
-                message: "License valid",
-                expires_at: row.expires_at
-            });
-
+            if (activation.rowCount === 0) {
+                return res.json({
+                    valid: false,
+                    message: "License activated on another device"
+                });
+            }
         }
 
         return res.json({
-            valid: false,
-            message: "License already activated on another device"
+            valid: true,
+            message: row.machine_id ? "License valid" : "License activated",
+            expires_at: row.expires_at
         });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ valid: false, message: "License database error" });
     }
+});
 
-    // First activation
-    db.prepare(`
-        UPDATE licenses
-        SET machine_id = ?,
-            activation_count = activation_count + 1
-        WHERE license_key = ?
-    `).run(
-        machine_id,
-        license
-    );
-
-    return res.json({
-        valid: true,
-        message: "License activated",
-        expires_at: row.expires_at
+initializeDatabase()
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log(`REMMM License API listening on port ${PORT}`);
+        });
+    })
+    .catch(error => {
+        console.error("Could not initialize license database", error);
+        process.exit(1);
     });
-});
-
-// ------------------------------------------
-// START
-// ------------------------------------------
-
-app.listen(PORT, () => {
-
-    console.log(`
-=================================
- REMMM LICENSE API
-=================================
-
-Server:
-http://localhost:${PORT}
-
-Status:
-ONLINE
-`);
-});
