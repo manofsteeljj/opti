@@ -1,0 +1,6 @@
+.env
+node_modules/
+**/node_modules/
+.licenses.db
+.licenses.db-shm
+.licenses.db-wal
