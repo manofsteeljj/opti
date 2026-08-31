@@ -147,31 +147,26 @@ app.post("/api/license/activate", async (req, res) => {
             return res.json({ valid: false, message: "License expired" });
         }
 
-        if (row.machine_id && row.machine_id !== machine_id) {
+        // Check if license has already been used
+        if (row.activation_count >= row.max_activations) {
             return res.json({
                 valid: false,
-                message: "License already activated on another device"
+                message: "License has already been used"
             });
         }
 
-        if (!row.machine_id) {
-            const activation = await pool.query(`
-                UPDATE licenses
-                SET machine_id = $1, activation_count = activation_count + 1
-                WHERE license_key = $2 AND machine_id IS NULL
-            `, [machine_id, license]);
-
-            if (activation.rowCount === 0) {
-                return res.json({
-                    valid: false,
-                    message: "License activated on another device"
-                });
-            }
-        }
+        // Mark license as used (single-use)
+        await pool.query(`
+            UPDATE licenses
+            SET machine_id = $1, 
+                activation_count = activation_count + 1,
+                status = 'used'
+            WHERE license_key = $2
+        `, [machine_id, license]);
 
         return res.json({
             valid: true,
-            message: row.machine_id ? "License valid" : "License activated",
+            message: "License activated successfully",
             expires_at: row.expires_at
         });
     } catch (error) {
